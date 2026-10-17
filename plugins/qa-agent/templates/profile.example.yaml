@@ -1,0 +1,99 @@
+# qa/profile.yaml: everything the QA agent needs to know about one app.
+# Commit it at the app repo's root under qa/. Validate with:
+#   "${CLAUDE_PLUGIN_ROOT}/scripts/qa.py" validate
+#
+# Templating, usable in any string value:
+#   {urls.api}            a value from this file
+#   {token}               the persona's token (in personas.*.headers / browser)
+#   {env:VAR}             an environment variable (left as-is if unset)
+#   {env:VAR|default}     ...with a fallback
+# Relative paths resolve against the repo root (the parent of qa/).
+
+name: myapp                      # required
+description: One paragraph on what the app does and who uses it.
+
+# Required. The ONLY hosts the agent may reach: API, DB, browser. Local or
+# staging only. Supports "*.staging.example.com".
+allowed_hosts: [127.0.0.1, localhost]
+
+urls:                            # required; every host must be in allowed_hosts
+  api: http://127.0.0.1:8000
+  web: http://127.0.0.1:5173
+
+repos:                           # optional sibling repos (frontend, workers...)
+  frontend: ../myapp-web         # or { path: ../myapp-web, diff_base: origin/main }
+
+diff_base: origin/main           # what `plan --changed` diffs against
+
+env:                             # applied to every service; pin safe values here
+  APP_ENV: development
+  DATABASE_URL: "{env:QA_DATABASE_URL|postgresql://app:app@127.0.0.1:5432/app}"
+
+services:                        # booted in order by `qa.py up`
+  - name: db
+    check: pg_isready -q -h 127.0.0.1 -p 5432   # exit 0 => already up, skip start
+    start: docker compose up -d db
+    background: false                          # wait for `start` to exit
+    ready: { cmd: pg_isready -q -h 127.0.0.1 -p 5432, timeout: 60 }
+  - name: migrate
+    run: make migrate                          # one-shot; must exit 0
+  - name: api
+    cwd: backend
+    start: make dev                            # background by default; logs in .qa/runs/<run>/logs/
+    env: { PORT: "8000" }
+    ready: { http: "http://127.0.0.1:8000/health", timeout: 120 }
+
+database:                        # for read-only `qa.py sql`
+  url_env: DATABASE_URL          # or url: postgresql://...
+
+reset:                           # local-only clean slate; steps are http or cmd
+  - http: { method: POST, path: /dev/reset, expect: [200, 204] }
+  # - cmd: ./scripts/reset_local_db.sh
+
+personas:                        # every role, plus a SECOND tenant per data-owning role
+  admin_a:
+    description: Who this is and what they own.
+    login:                       # an http or cmd step; its JSON output holds the token
+      http: { method: POST, path: /dev/login, json: { role: admin } }
+    token: token                 # dot-path into the login response (default "token")
+    headers: { Authorization: "Bearer {token}" }   # default shown
+    browser:                     # how to sign the browser in with that token
+      url: http://127.0.0.1:5173/
+      session_storage: { app_session: "{token}" }
+      # local_storage: { ... }
+
+fixtures:                        # named files journeys can upload
+  sample_csv: fixtures/sample.csv
+
+notes: |
+  Domain knowledge the agent must not rediscover: where the API schema is,
+  what's stubbed, async steps and how to poll them, known non-bugs.
+
+journeys:                        # golden paths; `checks` must be objective
+  - id: j-signup-to-first-report
+    title: New user gets from signup to their first report
+    smoke: true                  # runs when --changed matches nothing
+    paths: [backend/api/**, "frontend:src/pages/report/**"]
+    steps:
+      - User-level steps, in order.
+    checks:
+      - Verifiable statements (status codes, DB rows, totals, no console errors).
+
+invariants:                      # rules that must never break; run first
+  - id: inv-tenant-isolation
+    rule: A tenant never reads or changes another tenant's data.
+    always: true                 # included in every --changed plan
+    paths: [backend/**]
+    how:
+      - Concrete attacks to start from.
+
+charters:                        # exploratory missions (`plan --include-charters`)
+  - id: ch-upload-abuse
+    mission: What to try to break, with example edge cases.
+    budget: 40                   # max actions
+
+regression_tests:                # where/how confirmed bugs become tests
+  dir: backend/tests
+  framework: pytest
+  conventions: |
+    Fixtures to use, naming, the command to run one test.

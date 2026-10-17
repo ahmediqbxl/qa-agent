@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__plugin_qa-agent_playwright__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/qa.py\" guard-url",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}

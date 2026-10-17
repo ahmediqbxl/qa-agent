@@ -1,0 +1,12 @@
+{
+  "name": "qa-agent",
+  "owner": { "name": "Ahmed Iqbal" },
+  "description": "App-agnostic QA agent for Claude Code.",
+  "plugins": [
+    {
+      "name": "qa-agent",
+      "source": "./plugins/qa-agent",
+      "description": "Boots your app from qa/profile.yaml, drives it as each persona through the browser and API, checks invariants against the database, and writes a findings report."
+    }
+  ]
+}

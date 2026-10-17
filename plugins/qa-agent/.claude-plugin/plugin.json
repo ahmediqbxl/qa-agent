@@ -1,0 +1,6 @@
+{
+  "name": "qa-agent",
+  "version": "0.1.0",
+  "description": "App-agnostic QA agent: one core, a qa/profile.yaml per app.",
+  "author": { "name": "Ahmed Iqbal" }
+}
