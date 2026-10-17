@@ -560,6 +560,8 @@ def _kv(items: list[str] | None) -> dict[str, str] | None:
 
 
 def _print_body(body: Any, limit: int) -> None:
+    if limit <= 0:
+        return
     text = body if isinstance(body, str) else json.dumps(body, indent=2, default=str)
     if len(text) > limit:
         text = text[:limit] + f"\n…(truncated, {len(text)} chars; full body in evidence)"
@@ -1089,6 +1091,9 @@ def main(argv: list[str] | None = None) -> None:
     args = ap.parse_args(argv)
     try:
         args.fn(args)
+    except BrokenPipeError:
+        # Output piped into `head` etc.; the work (and its evidence) is done.
+        sys.stderr.close()
     except QAError as exc:
         print(f"qa: {exc}", file=sys.stderr)
         sys.exit(1)
