@@ -9,6 +9,11 @@
 #   {env:VAR|default}     ...with a fallback
 # Relative paths resolve against the repo root (the parent of qa/).
 
+# extends: ../../backend-repo/qa/profile.yaml   # reuse another repo's profile;
+#   this file then only overrides what differs (maps merge, lists replace).
+#   Relative paths keep resolving against the base repo. `qa.py init --extends`
+#   writes this for you.
+
 name: myapp                      # required
 description: One paragraph on what the app does and who uses it.
 
@@ -61,6 +66,10 @@ personas:                        # every role, plus a SECOND tenant per data-own
       url: http://127.0.0.1:5173/
       session_storage: { app_session: "{token}" }
       # local_storage: { ... }
+  # A persona whose token is only known mid-run (e.g. a user created by a
+  # journey): `qa.py var set user_id <id>` first.
+  # client_portal:
+  #   login: { value: "dev:{vars.user_id}" }
 
 fixtures:                        # named files journeys can upload
   sample_csv: fixtures/sample.csv
@@ -91,6 +100,37 @@ charters:                        # exploratory missions (`plan --include-charter
   - id: ch-upload-abuse
     mission: What to try to break, with example edge cases.
     budget: 40                   # max actions
+
+ux:                              # optional: UX mode (`/qa-agent:qa ux`)
+  base_url: "{urls.web}"
+  design_docs: [docs/DESIGN.md]  # rules the heuristic review checks against
+  viewports:                     # default: desktop 1440x900 + phone 390x844
+    desktop: { width: 1440, height: 900 }
+    phone: { width: 390, height: 844, touch: true }
+  themes:                        # how the app stores its theme (applied before load)
+    light: { local_storage: { theme: light } }
+    dark: { local_storage: { theme: dark }, color_scheme: dark }
+  ready_budget_s: 5              # slower first usable paint is flagged
+  diff_threshold: 0.01           # >1% pixels changed vs baseline = visual change
+  # baseline_dir: qa/ux-baseline # commit baselines here; default .qa/ux-baseline (local)
+  axe: { tags: [wcag2a, wcag2aa], impacts: [critical, serious], ignore: [] }
+  screens:                       # what `qa.py ux-check` visits
+    - id: dashboard
+      path: /dashboard
+      persona: admin_a
+      ready: { text: "Welcome" } # or { selector: "main h1" }; regex, case-insensitive
+      paths: ["frontend:src/pages/dashboard/**"]   # for `ux-check --changed`
+    - id: record
+      path: /records/{vars.record_id}              # filled by `qa.py var set`
+      persona: admin_a
+      via: ["/records"]          # visit first when the screen restores from app state
+      ready: { text: "Save" }
+  tasks:                         # goal-based walkthroughs; logged with `qa.py ux-log`
+    - id: ux-first-report
+      persona: admin_a
+      goal: You're new. Create your first report and share it with a colleague.
+      success: The colleague can open the report (check via API).
+      budget_steps: 12
 
 regression_tests:                # where/how confirmed bugs become tests
   dir: backend/tests

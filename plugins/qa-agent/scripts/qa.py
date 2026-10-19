@@ -98,20 +98,60 @@ def save_state(state: dict[str, Any]) -> None:
     p.write_text(json.dumps(state, indent=2))
 
 
-def load_profile(path: Path) -> dict[str, Any]:
+def _deep_merge(base: Any, over: Any) -> Any:
+    """Maps merge key by key; anything else (lists included) is replaced."""
+    if isinstance(base, dict) and isinstance(over, dict):
+        out = dict(base)
+        for k, v in over.items():
+            out[k] = _deep_merge(base.get(k), v) if k in base else v
+        return out
+    return over
+
+
+def _repo_dir(profile_path: Path) -> Path:
+    parent = profile_path.parent
+    return parent.parent if parent.name == "qa" else parent
+
+
+def _load_raw(path: Path, seen: tuple[Path, ...] = ()) -> tuple[dict[str, Any], Path]:
+    """Load a profile and its ``extends`` chain; returns (data, root of the base)."""
     import yaml
 
+    path = path.resolve()
+    if path in seen:
+        raise QAError(f"profile extends itself: {' -> '.join(map(str, (*seen, path)))}")
     data = yaml.safe_load(path.read_text()) or {}
+    parent = data.pop("extends", None)
+    if not parent:
+        return data, _repo_dir(path)
+    base_path = (path.parent / parent).resolve()
+    if not base_path.is_file():
+        raise QAError(
+            f"{path} extends {parent}, which does not exist ({base_path}). "
+            "Clone that repo next to this one."
+        )
+    base, root = _load_raw(base_path, (*seen, path))
+    return _deep_merge(base, data), root
+
+
+def load_profile(path: Path) -> dict[str, Any]:
+    """Load a profile; ``extends: <path>`` layers it over another repo's profile.
+
+    Relative paths inside the merged profile resolve against the root of the
+    profile at the bottom of the chain (``_root``), so a frontend repo can
+    reuse the backend repo's profile unchanged.
+    """
+    data, root = _load_raw(path)
     errors = validate_profile(data)
     if errors:
         raise QAError("invalid profile:\n  - " + "\n  - ".join(errors))
+    data["_root"] = str(root)
     return data
 
 
 def profile_root(profile_path: Path) -> Path:
-    """The directory a profile's relative paths resolve against: the repo root."""
-    parent = profile_path.parent
-    return parent.parent if parent.name == "qa" else parent
+    """The directory a profile's relative paths resolve against."""
+    return Path(load_profile(profile_path)["_root"])
 
 
 def validate_profile(p: dict[str, Any]) -> list[str]:
@@ -146,6 +186,30 @@ def validate_profile(p: dict[str, Any]) -> list[str]:
             if item["id"] in seen:
                 errors.append(f"duplicate id {item['id']!r}")
             seen.add(item["id"])
+    ux = p.get("ux")
+    if ux is not None:
+        if not isinstance(ux, dict):
+            errors.append("`ux` must be a map")
+        else:
+            for name, vp in (ux.get("viewports") or {}).items():
+                if not isinstance(vp, dict) or not {"width", "height"} <= set(vp):
+                    errors.append(f"ux.viewports.{name} needs width and height")
+            personas = set((p.get("personas") or {}).keys())
+            for section in ("screens", "tasks"):
+                for i, item in enumerate(ux.get(section, []) or []):
+                    if not isinstance(item, dict) or "id" not in item:
+                        errors.append(f"ux.{section}[{i}] needs an `id`")
+                        continue
+                    if item["id"] in seen:
+                        errors.append(f"duplicate id {item['id']!r}")
+                    seen.add(item["id"])
+                    if section == "screens" and "path" not in item:
+                        errors.append(f"ux.screens.{item['id']} needs a `path`")
+                    if section == "tasks" and "goal" not in item:
+                        errors.append(f"ux.tasks.{item['id']} needs a `goal`")
+                    who = item.get("persona")
+                    if who and who not in personas:
+                        errors.append(f"ux.{section}.{item['id']}: unknown persona {who!r}")
     return errors
 
 
@@ -223,7 +287,7 @@ class Run:
         self.state = state
         self.profile_path = Path(state["profile"])
         self.profile = load_profile(self.profile_path)
-        self.root = profile_root(self.profile_path)
+        self.root = Path(self.profile["_root"])
         self.dir = Path(state["run_dir"])
         self.allowed = self.profile.get("allowed_hosts", DEFAULT_ALLOWED_HOSTS)
 
@@ -234,6 +298,11 @@ class Run:
             "root": str(self.root),
             "run_dir": str(self.dir),
             "repos": {k: str((self.root / v).resolve()) for k, v in self.repos.items()},
+            "vars": self.state.get("vars", {}),
+            "fixtures": {
+                k: str((self.root / v).resolve())
+                for k, v in (self.profile.get("fixtures") or {}).items()
+            },
         }
 
     @property
@@ -629,7 +698,11 @@ def _run_step(run: Run, step: dict[str, Any], ctx: dict[str, Any]) -> Any:
             return json.loads(out.stdout)
         except ValueError:
             return out.stdout.strip()
-    raise QAError(f"step needs `http` or `cmd`: {step}")
+    if "value" in step:
+        if _TEMPLATE.search(str(step["value"])):
+            raise QAError(f"step value {step['value']!r} has unset vars (qa.py var set ...)")
+        return step["value"]
+    raise QAError(f"step needs `http`, `cmd` or `value`: {step}")
 
 
 def cmd_reset(_: argparse.Namespace) -> None:
@@ -785,6 +858,14 @@ def cmd_plan(args: argparse.Namespace) -> None:
     run = current_run()
     p = run.profile
     sections = {s: list(p.get(s, []) or []) for s in ("journeys", "invariants", "charters")}
+    if args.ux:
+        ux = p.get("ux") or {}
+        if not ux:
+            raise QAError("profile has no `ux` section (see templates/profile.example.yaml)")
+        sections = {
+            "ux_tasks": list(ux.get("tasks") or []),
+            "ux_screens": list(ux.get("screens") or []),
+        }
     selected: dict[str, list[dict[str, Any]]] = {s: [] for s in sections}
     reason = "full run"
     if args.only:
@@ -811,20 +892,23 @@ def cmd_plan(args: argparse.Namespace) -> None:
                     selected[s].append(item)
         if not any(selected.values()):
             for s, items in sections.items():
-                selected[s] = [i for i in items if i.get("smoke")]
-            reason = "no path matched; running smoke items"
+                # UX items carry no smoke flag: an unmatched diff checks them all.
+                selected[s] = [i for i in items if i.get("smoke") or s.startswith("ux_")]
+            reason = "no path matched; running smoke items" + (" (all UX items)" if args.ux else "")
         else:
             reason = f"diff-aware vs {base}"
     else:
         selected = sections
-        if not args.include_charters:
+        if not args.include_charters and "charters" in sections:
             selected = {**sections, "charters": []}
     import yaml
 
     print(f"plan: {reason}")
-    out = {s: v for s, v in selected.items() if v}
+    out = render({s: v for s, v in selected.items() if v}, run.ctx)
     print(yaml.safe_dump(out, sort_keys=False, width=100))
-    run.state["plan"] = {s: [i["id"] for i in v] for s, v in selected.items()}
+    plan = run.state.get("plan") or {}
+    plan.update({s: [i["id"] for i in v] for s, v in selected.items()})
+    run.state["plan"] = plan
     run.save()
 
 
@@ -919,6 +1003,7 @@ def cmd_report(_: argparse.Namespace) -> None:
         result = c["result"] if c else "not run"
         note = (c or {}).get("note", "").replace("|", "\\|").replace("\n", " ")
         lines.append(f"| `{item_id}` | {result} | {note} |")
+    lines += _ux_report_lines(run)
     lines += ["", "## Findings", ""]
     if not findings:
         lines.append("No findings.")
@@ -956,6 +1041,348 @@ def cmd_report(_: argparse.Namespace) -> None:
     )
     print(f"report: {report}")
     print(f"json:   {run.dir / 'report.json'}")
+
+
+# --------------------------------------------------------------------------
+# Run variables (ids created during a run, used in screen paths)
+# --------------------------------------------------------------------------
+
+
+def cmd_var(args: argparse.Namespace) -> None:
+    run = current_run()
+    vars_ = run.state.setdefault("vars", {})
+    if args.action == "set":
+        if args.value is None:
+            raise QAError("usage: qa.py var set <name> <value>")
+        vars_[args.name] = args.value
+        run.save()
+        print(f"{args.name} = {args.value}")
+    elif args.action == "get":
+        if args.name not in vars_:
+            raise QAError(f"no var {args.name!r}; set: {', '.join(vars_) or 'none'}")
+        print(vars_[args.name])
+    else:
+        print(json.dumps(vars_, indent=2))
+
+
+# --------------------------------------------------------------------------
+# UX: automated checks, baselines, friction log
+# --------------------------------------------------------------------------
+
+DEFAULT_VIEWPORTS = {
+    "desktop": {"width": 1440, "height": 900},
+    "phone": {"width": 390, "height": 844, "touch": True},
+}
+
+
+def _chromium() -> str | None:
+    path = os.environ.get("QA_CHROMIUM")
+    if path:
+        return path
+    return "/opt/pw-browsers/chromium" if Path("/opt/pw-browsers/chromium").exists() else None
+
+
+def _baseline_dir(run: Run) -> Path:
+    ux = run.profile.get("ux") or {}
+    rel = ux.get("baseline_dir")
+    return (run.root / rel).resolve() if rel else project_root() / ".qa" / "ux-baseline"
+
+
+def _ux_screens(run: Run, only: str | None, changed: bool, base: str | None) -> list[dict]:
+    screens = list((run.profile.get("ux") or {}).get("screens") or [])
+    if only:
+        wanted = set(only.split(","))
+        return [s for s in screens if s["id"] in wanted]
+    if changed:
+        b = base or run.profile.get("diff_base", "origin/main")
+        files = _changed_files(run.root, b)
+        for name, rel in run.repos.items():
+            repo = (run.root / rel).resolve()
+            if repo.is_dir():
+                files += [
+                    f"{name}:{f}" for f in _changed_files(repo, base or run.repo_base(name, b))
+                ]
+        hit = [
+            s
+            for s in screens
+            if any(_glob_re(pt).match(f) for pt in s.get("paths", []) for f in files)
+        ]
+        return hit or screens
+    return screens
+
+
+def cmd_ux_check(args: argparse.Namespace) -> None:
+    run = current_run()
+    ux = run.profile.get("ux") or {}
+    if not ux.get("screens"):
+        raise QAError("profile has no ux.screens to check")
+    base_url = render(ux.get("base_url", "{urls.web}"), run.ctx)
+    guard(base_url, run.allowed)
+    screens = _ux_screens(run, args.only, args.changed, args.base)
+    viewports = ux.get("viewports") or DEFAULT_VIEWPORTS
+    themes = ux.get("themes") or {}
+    if args.viewports:
+        viewports = {k: v for k, v in viewports.items() if k in args.viewports.split(",")}
+    if args.themes:
+        themes = {k: v for k, v in themes.items() if k in args.themes.split(",")}
+    rendered = []
+    for s in screens:
+        s = render(s, run.ctx)
+        if _TEMPLATE.search(s["path"]):
+            print(f"[{s['id']}] skipped: path {s['path']!r} needs a var (qa.py var set ...)")
+            continue
+        rendered.append(s)
+    personas = {}
+    for name, spec in (run.profile.get("personas") or {}).items():
+        token = run.state.get("tokens", {}).get(name)
+        if token is not None:
+            personas[name] = {
+                "browser": render(spec.get("browser") or {}, {**run.ctx, "token": token})
+            }
+    missing = {
+        s.get("persona") for s in rendered if s.get("persona") and s["persona"] not in personas
+    }
+    if missing:
+        raise QAError(f"log these personas in first: {', '.join(sorted(missing))}")
+    out_dir = run.dir / "ux"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    job = {
+        "base_url": base_url,
+        "allowed_hosts": run.allowed,
+        "run_dir": str(run.dir),
+        "screens": rendered,
+        "viewports": viewports,
+        "themes": themes,
+        "personas": personas,
+        "axe": ux.get("axe") or {},
+        "baseline_dir": str(_baseline_dir(run)),
+        "diff_threshold": ux.get("diff_threshold", 0.01),
+        "settle_ms": ux.get("settle_ms", 800),
+        "chromium": _chromium(),
+    }
+    job_path, out_path = out_dir / "job.json", out_dir / "last.json"
+    job_path.write_text(json.dumps(job, indent=2))
+    script = Path(__file__).with_name("ux.py")
+    print(
+        f"checking {len(rendered)} screen(s) x {len(viewports)} viewport(s) x {max(len(themes), 1)} theme(s)..."
+    )
+    proc = subprocess.run(
+        ["uv", "run", "--quiet", "--script", str(script), str(job_path), str(out_path)]
+    )
+    if proc.returncode != 0:
+        raise QAError(f"ux checks crashed (exit {proc.returncode})")
+    new = json.loads(out_path.read_text())["results"]
+    store = out_dir / "results.json"
+    allres = {
+        f"{r['screen']}|{r['viewport']}|{r['theme']}": r
+        for r in (json.loads(store.read_text()) if store.exists() else [])
+    }
+    for r in new:
+        allres[f"{r['screen']}|{r['viewport']}|{r['theme']}"] = r
+    store.write_text(json.dumps(list(allres.values()), indent=2))
+    budget = float(ux.get("ready_budget_s", 5))
+    print(f"{'screen':24} {'viewport':8} {'theme':6} {'ready':>6}  a11y  clip  ovl  tap  err  diff")
+    for r in new:
+        lay = r.get("layout") or {}
+        errs = len(r["console"]) + len(r["pageerrors"]) + sum(1 for h in r["http"] if h[:1] == "5")
+        ready = (
+            "FAIL"
+            if r.get("ready_s") is None
+            else f"{r['ready_s']:.1f}s" + ("!" if r["ready_s"] > budget else "")
+        )
+        diff = r.get("diff", "-")
+        diff = "CHANGED" if r.get("changed") else ("new" if diff == "no-baseline" else diff)
+        print(
+            f"{r['screen'][:24]:24} {r['viewport'][:8]:8} {r['theme'][:6]:6} {ready:>6}  "
+            f"{len(r.get('a11y') or []):4}  {len(lay.get('clipped') or []):4}  {len(lay.get('overlaps') or []):3}  "
+            f"{len(lay.get('smallTargets') or []):3}  {errs:3}  {diff}"
+            + ("  (redirected to " + r["final_path"] + ")" if r.get("redirected") else "")
+            + ("  " + r["error"] if r.get("error") else "")
+        )
+    print(
+        f"details: {store.relative_to(run.dir)}   screenshots: ux/shots/   "
+        f"(! = slower than ready_budget_s={budget:g})"
+    )
+
+
+def cmd_ux_baseline(args: argparse.Namespace) -> None:
+    import shutil
+
+    run = current_run()
+    shots = run.dir / "ux" / "shots"
+    if not shots.is_dir():
+        raise QAError("no screenshots in this run yet; run qa.py ux-check first")
+    dest = _baseline_dir(run)
+    dest.mkdir(parents=True, exist_ok=True)
+    picked = [
+        p
+        for p in shots.glob("*.png")
+        if not args.only or p.name.split("--")[0] in args.only.split(",")
+    ]
+    for p in picked:
+        shutil.copy2(p, dest / p.name)
+    print(f"accepted {len(picked)} screenshot(s) as baseline in {dest}")
+
+
+UX_EVENTS = ["start", "step", "backtrack", "confused", "error", "blocked", "done"]
+
+
+def cmd_ux_log(args: argparse.Namespace) -> None:
+    run = current_run()
+    _append(
+        _mkux(run),
+        {
+            "task": args.task,
+            "event": args.event,
+            "screen": args.screen or "",
+            "note": args.note or "",
+            "at": time.time(),
+        },
+    )
+    print(f"{args.task}: {args.event}" + (f" - {args.note}" if args.note else ""))
+
+
+def _mkux(run: Run) -> Path:
+    (run.dir / "ux").mkdir(parents=True, exist_ok=True)
+    return run.dir / "ux" / "friction.jsonl"
+
+
+def _ux_report_lines(run: Run) -> list[str]:
+    lines: list[str] = []
+    friction = _read_jsonl(run.dir / "ux" / "friction.jsonl")
+    tasks = {t["id"]: t for t in ((run.profile.get("ux") or {}).get("tasks") or [])}
+    if friction:
+        lines += [
+            "",
+            "## UX tasks",
+            "",
+            "| Task | Outcome | Steps | Backtracks | Confusions | Errors | Time |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        by: dict[str, list[dict]] = {}
+        for e in friction:
+            by.setdefault(e["task"], []).append(e)
+        notes: list[str] = []
+        for task, evs in by.items():
+            c = {k: sum(1 for e in evs if e["event"] == k) for k in UX_EVENTS}
+            outcome = "done" if c["done"] else ("blocked" if c["blocked"] else "unfinished")
+            secs = round(evs[-1]["at"] - evs[0]["at"])
+            budget = tasks.get(task, {}).get("budget_steps")
+            steps = f"{c['step']}" + (f" / {budget}" if budget else "")
+            lines.append(
+                f"| `{task}` | {outcome} | {steps} | {c['backtrack']} | {c['confused']} | "
+                f"{c['error']} | {secs // 60}m{secs % 60:02d}s |"
+            )
+            for e in evs:
+                if e["event"] in ("confused", "backtrack", "error", "blocked") and e["note"]:
+                    where = f" ({e['screen']})" if e["screen"] else ""
+                    notes.append(f"- **{task}** {e['event']}{where}: {e['note']}")
+        if notes:
+            lines += ["", "**Where the guidance fell short**", "", *notes]
+    store = run.dir / "ux" / "results.json"
+    if store.exists():
+        res = json.loads(store.read_text())
+        budget = float((run.profile.get("ux") or {}).get("ready_budget_s", 5))
+        lines += [
+            "",
+            "## UX checks",
+            "",
+            "| Screen | Viewport | Theme | Ready | A11y (serious+) | Clipped | Small targets | Errors | Visual diff |",
+            "|---|---|---|---|---|---|---|---|---|",
+        ]
+        for r in res:
+            lay = r.get("layout") or {}
+            errs = (
+                len(r["console"]) + len(r["pageerrors"]) + sum(1 for h in r["http"] if h[:1] == "5")
+            )
+            ready = (
+                "never"
+                if r.get("ready_s") is None
+                else f"{r['ready_s']}s" + (" (slow)" if r["ready_s"] > budget else "")
+            )
+            diff = (
+                "changed"
+                if r.get("changed")
+                else ("new" if r.get("diff") == "no-baseline" else (r.get("diff") or "-"))
+            )
+            a11y = ", ".join(f"{v['id']}x{v['count']}" for v in r.get("a11y") or []) or "0"
+            lines.append(
+                f"| `{r['screen']}` | {r['viewport']} | {r['theme']} | {ready} | {a11y} | "
+                f"{len(lay.get('clipped') or [])} | {len(lay.get('smallTargets') or [])} | {errs} | {diff} |"
+            )
+    return lines
+
+
+# --------------------------------------------------------------------------
+# init: wire the QA agent into a repo
+# --------------------------------------------------------------------------
+
+SETTINGS_SNIPPET = {
+    "extraKnownMarketplaces": {
+        "qa-agent": {"source": {"source": "github", "repo": "ahmediqbxl/qa-agent"}}
+    },
+    "enabledPlugins": {"qa-agent@qa-agent": True},
+}
+
+
+def cmd_init(args: argparse.Namespace) -> None:
+    root = project_root()
+    qa_dir = root / "qa"
+    profile = qa_dir / "profile.yaml"
+    if profile.exists() and not args.force:
+        print(f"exists: {profile.relative_to(root)} (use --force to overwrite)")
+    else:
+        qa_dir.mkdir(exist_ok=True)
+        if args.extends:
+            base = (qa_dir / args.extends).resolve()
+            if not base.is_file():
+                raise QAError(f"--extends target not found: {base}")
+            name = args.name or root.name
+            profile.write_text(
+                f"# QA agent profile for {name}: reuses {args.extends}.\n"
+                "# Anything set here overrides the base (maps merge, lists replace).\n"
+                "# Relative paths still resolve against the base repo.\n"
+                f"extends: {args.extends}\n"
+                f"name: {name}\n"
+                f"diff_base: {args.diff_base}\n"
+            )
+        else:
+            tmpl = Path(__file__).resolve().parent.parent / "templates" / "profile.example.yaml"
+            profile.write_text(
+                tmpl.read_text().replace("name: myapp", f"name: {args.name or root.name}")
+            )
+        print(f"wrote {profile.relative_to(root)}")
+    settings = root / ".claude" / "settings.json"
+    data = json.loads(settings.read_text()) if settings.exists() else {}
+    merged = _deep_merge(data, SETTINGS_SNIPPET)
+    if merged != data:
+        settings.parent.mkdir(exist_ok=True)
+        settings.write_text(json.dumps(merged, indent=2) + "\n")
+        print(f"updated {settings.relative_to(root)} (teammates get the plugin offered)")
+    gi = root / ".gitignore"
+    lines = gi.read_text().splitlines() if gi.exists() else []
+    adds = [x for x in (".qa/",) if x not in lines]
+    if any(line.strip() in (".claude", ".claude/") for line in lines):
+        lines = [
+            (".claude/*" if line.strip() in (".claude", ".claude/") else line) for line in lines
+        ]
+        adds.append("!.claude/settings.json")
+    if adds:
+        gi.write_text("\n".join(lines + ["", "# QA agent", *adds]) + "\n")
+        print(f"updated .gitignore ({', '.join(adds)})")
+    try:
+        merged = load_profile(profile)
+        if args.extends:
+            print(
+                f"profile validates: {len(merged.get('journeys') or [])} journeys, "
+                f"{len(merged.get('invariants') or [])} invariants, "
+                f"{len((merged.get('ux') or {}).get('screens') or [])} UX screens from the base. "
+                "Run /qa-agent:qa from this repo."
+            )
+        else:
+            print("profile validates. Next: fill in services/personas/journeys, then /qa-agent:qa")
+    except QAError as exc:
+        print(f"profile needs work before a run:\n{exc}")
 
 
 # --------------------------------------------------------------------------
@@ -1070,7 +1497,44 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--base", help="git ref to diff against (default profile.diff_base)")
     s.add_argument("--only", help="comma-separated item ids")
     s.add_argument("--include-charters", action="store_true", help="add exploratory charters")
+    s.add_argument("--ux", action="store_true", help="plan ux.tasks and ux.screens instead")
     s.set_defaults(fn=cmd_plan)
+
+    s = sub.add_parser("init", help="add qa/profile.yaml + plugin wiring to this repo")
+    s.add_argument(
+        "--extends", help="reuse another repo's profile, e.g. ../../finance-ai/qa/profile.yaml"
+    )
+    s.add_argument("--name", help="profile name (default: repo folder)")
+    s.add_argument("--diff-base", default="origin/main")
+    s.add_argument("--force", action="store_true", help="overwrite an existing profile")
+    s.set_defaults(fn=cmd_init)
+
+    s = sub.add_parser("var", help="run variables used in templated paths ({vars.name})")
+    s.add_argument("action", choices=["set", "get", "list"])
+    s.add_argument("name", nargs="?")
+    s.add_argument("value", nargs="?")
+    s.set_defaults(fn=cmd_var)
+
+    s = sub.add_parser(
+        "ux-check", help="accessibility, layout, errors, timing, visual diff per screen"
+    )
+    s.add_argument("--only", help="comma-separated ux.screens ids")
+    s.add_argument("--changed", action="store_true", help="screens whose paths match the diff")
+    s.add_argument("--base", help="git ref for --changed")
+    s.add_argument("--viewports", help="comma-separated subset of ux.viewports")
+    s.add_argument("--themes", help="comma-separated subset of ux.themes")
+    s.set_defaults(fn=cmd_ux_check)
+
+    s = sub.add_parser("ux-baseline", help="accept this run's screenshots as the visual baseline")
+    s.add_argument("--only", help="comma-separated screen ids")
+    s.set_defaults(fn=cmd_ux_baseline)
+
+    s = sub.add_parser("ux-log", help="friction log for a UX task walkthrough")
+    s.add_argument("task")
+    s.add_argument("event", choices=UX_EVENTS)
+    s.add_argument("--screen", help="where it happened")
+    s.add_argument("--note", help="what you expected vs what the UI said/did")
+    s.set_defaults(fn=cmd_ux_log)
 
     s = sub.add_parser("cover", help="record a journey/invariant/charter outcome")
     s.add_argument("id")

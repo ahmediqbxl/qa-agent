@@ -1,7 +1,7 @@
 ---
 name: qa
 description: Run the QA agent against this repo's app, using its qa/profile.yaml. It boots the stack, logs in as each persona, walks the journeys in the browser and the API, attacks the invariants (access control and data integrity), and writes a findings report. Use when asked to QA, smoke-test, regression-test or "try to break" the app, a branch or a PR.
-argument-hint: "[changed | full | explore | only=<id,id>] [--base <ref>]"
+argument-hint: "[changed | full | explore | ux | ux changed | only=<id,id>] [--base <ref>]"
 ---
 
 # QA agent
@@ -64,6 +64,7 @@ Choose the plan from the argument:
 | `full` | `"$QA" plan` |
 | `explore` | `"$QA" plan --include-charters` |
 | `only=a,b` | `"$QA" plan --only a,b` |
+| `ux` / `ux changed` | `"$QA" plan --ux [--changed]` (then follow **UX mode** below) |
 
 The plan prints the selected items in full. Work through them in this order:
 **invariants first** (they find the costliest bugs), then journeys, then charters.
@@ -91,6 +92,8 @@ reload.
 Browser mechanics (Playwright MCP tools `mcp__plugin_qa-agent_playwright__*`):
 - To sign in, run `qa.py login <persona>`; it prints the exact
   navigate / evaluate / navigate sequence for that persona.
+- Downloads and browser screenshots land in `$CLAUDE_PROJECT_DIR/.qa/browser/`
+  (the session root, which may be the parent of the app repo).
 - `browser_snapshot` is your eyes. Use `browser_take_screenshot` for evidence
   you will cite; files land in `.qa/browser/`.
 - After each step, check `browser_console_messages` and
@@ -102,6 +105,56 @@ Record every item's outcome as soon as you know it:
 ```bash
 "$QA" cover <id> pass|fail|blocked|skipped --note "one line: what you saw"
 ```
+
+### UX mode (`ux`)
+
+UX testing asks three things: **did it work, did the UI break, and did the
+on-screen guidance make sense.** It has two parts, so run both.
+
+**A. Automated checks.** These are objective, so findings that come from them
+are `confirmed`.
+
+```bash
+"$QA" var set client_id <id>          # any {vars.*} the ux.screens paths need
+"$QA" ux-check [--changed] [--only a,b] [--viewports phone] [--themes dark]
+```
+
+For every screen, viewport and theme, `ux-check` records:
+- time to the `ready` marker (flagged when over `ready_budget_s`)
+- axe-core accessibility violations at serious or critical impact
+- controls cut off or overlapping, and tap targets under 24px on touch viewports
+- console errors, page errors and 4xx/5xx API responses
+- a screenshot diffed against the baseline
+
+Before filing a layout finding, look at the screenshot it names
+(`ux/shots/<screen>--<viewport>--<theme>.png`). When a change is intended,
+accept the new screenshot with `"$QA" ux-baseline --only <screen>`.
+
+**B. Task walkthroughs** (`ux.tasks`). Read **only** the task's `goal` and
+`persona`. Don't follow a journey's steps, and don't read the code first: the
+point is to find out whether the UI alone gets a user there. Log as you go:
+
+```bash
+"$QA" ux-log <task> start
+"$QA" ux-log <task> step      --screen <where> --note "what you did"
+"$QA" ux-log <task> backtrack --screen <where> --note "went the wrong way because..."
+"$QA" ux-log <task> confused  --screen <where> --note "expected X; the UI said/did Y"
+"$QA" ux-log <task> error     --screen <where> --note "message shown, or what broke"
+"$QA" ux-log <task> done | blocked --note "outcome"
+```
+
+`confused` is the useful signal. Write down the exact copy you saw and what
+you expected. Look for missing or misleading labels, actions with no feedback,
+warnings that show up after the action instead of before, and jargon. Then
+check the task's `success` objectively (API, DB, or the downloaded file). Also
+compare screens against `ux.design_docs` when they're listed. Heuristic
+findings (consistency, empty states, error messages, visible system status)
+are `kind: ux` with `confidence: speculative` unless something objective backs
+them up.
+
+The report gets a **UX tasks** table (steps against budget, backtracks,
+confusions, errors, time) with "Where the guidance fell short" listed under it,
+and a **UX checks** table for every screen, viewport and theme.
 
 ### 4. Record findings
 
